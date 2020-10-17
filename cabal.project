@@ -1,0 +1,4 @@
+executable-stripping: True
+optimization: True
+packages:
+  ./hacpi.cabal
