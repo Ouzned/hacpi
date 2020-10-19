@@ -1,15 +1,20 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Main where
+module Hacpi
+  ( AcpiEvent (..),
+    acpiListen,
+  )
+where
 
 import Control.Applicative
+import Control.Concurrent (forkIO)
+import Control.Monad (unless)
 import Data.Attoparsec.Text
-import Data.ByteString (ByteString)
 import Data.Char
-import Data.Connection
+import Data.Connection as C
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as E
-import qualified System.IO.Streams as Streams
+import GHC.Conc (ThreadId)
+import qualified System.IO.Streams as S
 import System.IO.Streams.TCP (TCPConnection)
 import qualified System.IO.Streams.UnixSocket as UnixSocket
 
@@ -26,37 +31,38 @@ data AcpiEvent
   | BrightnessDown
   deriving (Show)
 
-main :: IO ()
-main = do
-  con <- acpidSocket
-  readEvents $ source con
-
 acpidSocket :: IO TCPConnection
 acpidSocket = UnixSocket.connect "/var/run/acpid.socket"
 
-readEvents :: Streams.InputStream ByteString -> IO ()
-readEvents input = do
-  val <- fmap (fmap E.decodeUtf8) (Streams.read input)
-  case val of
-    (Just text) -> do
-      handleEvents text
-      readEvents input
-    Nothing -> putStrLn "Socket closed"
-
-dispatchEvent :: AcpiEvent -> IO ()
-dispatchEvent BrightnessUp = putStrLn "up"
-dispatchEvent BrightnessDown = putStrLn "down"
-dispatchEvent e = putStrLn $ show e
-
-handleEvents :: T.Text -> IO ()
-handleEvents source = handleResult $ parse acpiParser source
+acpiListen :: (AcpiEvent -> IO ()) -> IO (ThreadId)
+acpiListen action = forkIO $ do
+  con <- acpidSocket
+  s <- S.decodeUtf8 $ C.source con
+  readEvents s
+  C.close con
   where
-    handleResult (Done rest event) = do
-      dispatchEvent event
-      if (T.null rest)
-        then return ()
-        else handleEvents rest
-    handleResult _ = return ()
+    readEvents s = do
+      text <- readStream s
+      handleEvent s $ parse acpiParser text
+
+    handleEvent s event = case event of
+      (Done r event) -> do
+        action event
+        S.unRead r s
+        readEvents s
+      (Fail _ _ _) -> do
+        readEvents s
+      e@(Partial _) -> do
+        isEOF <- S.atEOF s
+        unless isEOF $ do
+          text <- readStream s
+          handleEvent s $ feed e text
+        return ()
+
+readStream :: S.InputStream T.Text -> IO T.Text
+readStream s = do
+  text <- S.read s
+  return $ maybe "" id text
 
 acpiParser :: Parser AcpiEvent
 acpiParser =
@@ -139,7 +145,7 @@ batteryOff =
 
 lidClose :: Parser AcpiEvent
 lidClose =
-  "button/lid"
+  "button/lid LID"
     *> space
     *> "close"
     *> takeTill isEndOfLine
@@ -148,7 +154,7 @@ lidClose =
 
 lidOpen :: Parser AcpiEvent
 lidOpen =
-  "button/lid"
+  "button/lid LID"
     *> space
     *> "open"
     *> takeTill isEndOfLine
