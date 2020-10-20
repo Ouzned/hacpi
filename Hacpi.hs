@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Hacpi
@@ -11,6 +12,7 @@ import Control.Concurrent (forkIO)
 import Control.Exception (catch)
 import Data.Attoparsec.Text
 import Data.Char
+import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import GHC.Conc (ThreadId)
 import Network.Socket
@@ -38,34 +40,33 @@ connectAcpid = do
   return h
 
 acpiListen :: (AcpiEvent -> IO ()) -> IO (ThreadId)
-acpiListen action = do
-  h <- connectAcpid
-  forkIO $ readEvent h `catch` closeHandle h
+acpiListen action = connectAcpid >>= runLoop
   where
-    readEvent h = do
-      l <- T.hGetLine h
-      case parseOnly acpiParser l of
-        (Right e) -> do
-          forkIO $ action e
-          readEvent h
-        (Left _) -> readEvent h
+    runLoop h = forkIO $ handleEvent h `catch` closeHandle h
 
-    closeHandle :: Handle -> IOError -> IO ()
-    closeHandle h _ = hClose h
+    handleEvent h =
+      fmap parseEvent (T.hGetLine h) >>= \case
+        Right e -> forkIO (action e) >> handleEvent h
+        Left _ -> handleEvent h
+
+parseEvent :: T.Text -> Either String AcpiEvent
+parseEvent = parseOnly acpiParser
+
+closeHandle :: Handle -> IOError -> IO ()
+closeHandle h _ = hClose h
 
 acpiParser :: Parser AcpiEvent
 acpiParser =
-  ( buttonPower
-      <|> buttonSleep
-      <|> acAdapterPlugged
-      <|> acAdapterUnplugged
-      <|> batteryOn
-      <|> batteryOff
-      <|> lidClose
-      <|> lidOpen
-      <|> brightnessUp
-      <|> brightnessDown
-  )
+  buttonPower
+    <|> buttonSleep
+    <|> acAdapterPlugged
+    <|> acAdapterUnplugged
+    <|> batteryOn
+    <|> batteryOff
+    <|> lidClose
+    <|> lidOpen
+    <|> brightnessUp
+    <|> brightnessDown
 
 buttonPower :: Parser AcpiEvent
 buttonPower =
