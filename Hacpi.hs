@@ -8,15 +8,13 @@ where
 
 import Control.Applicative
 import Control.Concurrent (forkIO)
-import Control.Monad (unless)
+import Control.Exception (catch)
 import Data.Attoparsec.Text
 import Data.Char
-import Data.Connection as C
-import qualified Data.Text as T
+import qualified Data.Text.IO as T
 import GHC.Conc (ThreadId)
-import qualified System.IO.Streams as S
-import System.IO.Streams.TCP (TCPConnection)
-import qualified System.IO.Streams.UnixSocket as UnixSocket
+import Network.Socket
+import System.IO (BufferMode (..), Handle, IOMode (..), hClose, hSetBuffering)
 
 data AcpiEvent
   = PowerButton
@@ -31,59 +29,49 @@ data AcpiEvent
   | BrightnessDown
   deriving (Show)
 
-acpidSocket :: IO TCPConnection
-acpidSocket = UnixSocket.connect "/var/run/acpid.socket"
+connectAcpid :: IO Handle
+connectAcpid = do
+  s <- socket AF_UNIX Stream defaultProtocol
+  connect s $ SockAddrUnix "/var/run/acpid.socket"
+  h <- socketToHandle s ReadMode
+  hSetBuffering h LineBuffering
+  return h
 
 acpiListen :: (AcpiEvent -> IO ()) -> IO (ThreadId)
-acpiListen action = forkIO $ do
-  con <- acpidSocket
-  s <- S.decodeUtf8 $ C.source con
-  readEvents s
-  C.close con
+acpiListen action = do
+  h <- connectAcpid
+  forkIO $ readEvent h `catch` closeHandle h
   where
-    readEvents s = do
-      text <- readStream s
-      handleEvent s $ parse acpiParser text
+    readEvent h = do
+      l <- T.hGetLine h
+      case parseOnly acpiParser l of
+        (Right e) -> do
+          forkIO $ action e
+          readEvent h
+        (Left _) -> readEvent h
 
-    handleEvent s event = case event of
-      (Done r event) -> do
-        action event
-        S.unRead r s
-        readEvents s
-      (Fail _ _ _) -> do
-        readEvents s
-      e@(Partial _) -> do
-        isEOF <- S.atEOF s
-        unless isEOF $ do
-          text <- readStream s
-          handleEvent s $ feed e text
-        return ()
-
-readStream :: S.InputStream T.Text -> IO T.Text
-readStream s = do
-  text <- S.read s
-  return $ maybe "" id text
+    closeHandle :: Handle -> IOError -> IO ()
+    closeHandle h _ = hClose h
 
 acpiParser :: Parser AcpiEvent
 acpiParser =
-  buttonPower
-    <|> buttonSleep
-    <|> acAdapterPlugged
-    <|> acAdapterUnplugged
-    <|> batteryOn
-    <|> batteryOff
-    <|> lidClose
-    <|> lidOpen
-    <|> brightnessUp
-    <|> brightnessDown
+  ( buttonPower
+      <|> buttonSleep
+      <|> acAdapterPlugged
+      <|> acAdapterUnplugged
+      <|> batteryOn
+      <|> batteryOff
+      <|> lidClose
+      <|> lidOpen
+      <|> brightnessUp
+      <|> brightnessDown
+  )
 
 buttonPower :: Parser AcpiEvent
 buttonPower =
   "button/power"
     *> space
     *> ("PBTN" <|> "PWRF")
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return PowerButton
 
 buttonSleep :: Parser AcpiEvent
@@ -91,8 +79,6 @@ buttonSleep =
   "button/sleep"
     *> space
     *> ("SLPB" <|> "SBTN")
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return SleepButton
 
 acAdapter :: Parser Char
@@ -108,16 +94,12 @@ acAdapterPlugged :: Parser AcpiEvent
 acAdapterPlugged =
   acAdapter
     *> "00000001"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return AcPlugged
 
 acAdapterUnplugged :: Parser AcpiEvent
 acAdapterUnplugged =
   acAdapter
     *> "00000000"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return AcUnplugged
 
 battery :: Parser Char
@@ -131,16 +113,12 @@ batteryOn :: Parser AcpiEvent
 batteryOn =
   battery
     *> "00000000"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return BatteryOn
 
 batteryOff :: Parser AcpiEvent
 batteryOff =
   battery
     *> "00000001"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return BatteryOff
 
 lidClose :: Parser AcpiEvent
@@ -148,8 +126,6 @@ lidClose =
   "button/lid LID"
     *> space
     *> "close"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return LidClosed
 
 lidOpen :: Parser AcpiEvent
@@ -157,20 +133,14 @@ lidOpen =
   "button/lid LID"
     *> space
     *> "open"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return LidOpened
 
 brightnessUp :: Parser AcpiEvent
 brightnessUp =
   "video/brightnessup"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return BrightnessUp
 
 brightnessDown :: Parser AcpiEvent
 brightnessDown =
   "video/brightnessdown"
-    *> takeTill isEndOfLine
-    *> (endOfLine <|> endOfInput)
     *> return BrightnessDown
